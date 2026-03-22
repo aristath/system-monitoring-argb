@@ -34,7 +34,8 @@ const LEDS_PER_GPU: usize = 4;
 // Smoothing — metric values
 const POLL_MS: u64 = 100;
 const EMA_ALPHA: f64 = 0.3;
-const DELTA_CAP: f64 = 3.0; // max % change per tick
+const DELTA_CAP_UP: f64 = 25.0;   // max % rise per tick
+const DELTA_CAP_DOWN: f64 = 2.5;  // max % fall per tick
 
 // Smoothing — RGB color (visual smoothness)
 const COLOR_ALPHA: f64 = 0.08;
@@ -75,8 +76,13 @@ fn gradient_color(pct: f64) -> (u8, u8, u8) {
 
 fn smooth(current: f64, target: f64) -> f64 {
     let ema = current + EMA_ALPHA * (target - current);
-    let delta = (ema - current).clamp(-DELTA_CAP, DELTA_CAP);
-    current + delta
+    let delta = ema - current;
+    let capped = if delta >= 0.0 {
+        delta.min(DELTA_CAP_UP)
+    } else {
+        delta.max(-DELTA_CAP_DOWN)
+    };
+    current + capped
 }
 
 struct SmoothColor {
