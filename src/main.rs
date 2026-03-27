@@ -43,10 +43,6 @@ const COLOR_ALPHA: f64 = 0.08;
 // Temperature range (°C)
 const TEMP_MIN: f64 = 35.0;
 const TEMP_MAX: f64 = 90.0;
-const TEMP_OFF_BELOW: f64 = 40.0;  // °C — below this, LEDs off
-
-// Idle threshold — below this %, LEDs off
-const IDLE_PCT: f64 = 5.0;
 
 // Color gradient: 11 stops from 0% to 100%
 const GRADIENT: [(u8, u8, u8); 11] = [
@@ -237,40 +233,31 @@ fn main() {
         // Start with all LEDs off
         let mut leds = [[0u8; 4]; 265];
 
-        // IO Cover (176-184): CPU temperature (R/G swapped, off below threshold)
-        if s_cpu_temp >= TEMP_OFF_BELOW {
-            let cpu_temp_rgb = c_cpu_temp.update(gradient_color(temp_to_pct(s_cpu_temp)));
-            for i in 0..IO_COVER_LEDS {
-                leds[IO_COVER_OFFSET + i] = [cpu_temp_rgb[1], cpu_temp_rgb[0], cpu_temp_rgb[2], 0];
-            }
+        // IO Cover (176-184): CPU temperature (R/G swapped)
+        let cpu_temp_rgb = c_cpu_temp.update(gradient_color(temp_to_pct(s_cpu_temp)));
+        for i in 0..IO_COVER_LEDS {
+            leds[IO_COVER_OFFSET + i] = [cpu_temp_rgb[1], cpu_temp_rgb[0], cpu_temp_rgb[2], 0];
         }
 
-        // PCB (161-175): GPU temperature (R/G swapped, off below threshold)
-        if s_gpu_temp >= TEMP_OFF_BELOW {
-            let gpu_temp_rgb = c_gpu_temp.update(gradient_color(temp_to_pct(s_gpu_temp)));
-            for i in 0..PCB_LEDS {
-                leds[PCB_OFFSET + i] = [gpu_temp_rgb[1], gpu_temp_rgb[0], gpu_temp_rgb[2], 0];
-            }
+        // PCB (161-175): GPU temperature (R/G swapped)
+        let gpu_temp_rgb = c_gpu_temp.update(gradient_color(temp_to_pct(s_gpu_temp)));
+        for i in 0..PCB_LEDS {
+            leds[PCB_OFFSET + i] = [gpu_temp_rgb[1], gpu_temp_rgb[0], gpu_temp_rgb[2], 0];
         }
 
-        // AIO pump: CPU + RAM (R/G swapped, off below threshold)
-        if s_cpu >= IDLE_PCT {
-            let cpu_rgb = c_cpu.update(gradient_color(s_cpu));
-            for &idx in &CPU_LEDS {
-                leds[AIO_OFFSET + idx] = [cpu_rgb[1], cpu_rgb[0], cpu_rgb[2], 0];
-            }
+        // AIO pump: CPU + RAM (R/G swapped for AIO zone)
+        let cpu_rgb = c_cpu.update(gradient_color(s_cpu));
+        for &idx in &CPU_LEDS {
+            leds[AIO_OFFSET + idx] = [cpu_rgb[1], cpu_rgb[0], cpu_rgb[2], 0];
         }
 
-        if s_ram >= IDLE_PCT {
-            let ram_rgb = c_ram.update(gradient_color(s_ram));
-            for &idx in &RAM_LEDS {
-                leds[AIO_OFFSET + idx] = [ram_rgb[1], ram_rgb[0], ram_rgb[2], 0];
-            }
+        let ram_rgb = c_ram.update(gradient_color(s_ram));
+        for &idx in &RAM_LEDS {
+            leds[AIO_OFFSET + idx] = [ram_rgb[1], ram_rgb[0], ram_rgb[2], 0];
         }
 
-        // Bottom fan: GPU busy (4 LEDs per GPU, R/G swapped, off below threshold)
+        // Bottom fan: GPU busy (4 LEDs per GPU, R/G swapped)
         for (i, c) in c_gpu_busy.iter_mut().enumerate() {
-            if s_gpu_busy[i] < IDLE_PCT { continue; }
             let rgb = c.update(gradient_color(s_gpu_busy[i]));
             let start = GPU_BUSY_START + i * LEDS_PER_GPU;
             for j in 0..LEDS_PER_GPU {
@@ -278,9 +265,8 @@ fn main() {
             }
         }
 
-        // Top fan: GPU VRAM (4 LEDs per GPU, R/G swapped, off below threshold)
+        // Top fan: GPU VRAM (4 LEDs per GPU, R/G swapped)
         for (i, c) in c_gpu_vram.iter_mut().enumerate() {
-            if s_gpu_vram[i] < IDLE_PCT { continue; }
             let rgb = c.update(gradient_color(s_gpu_vram[i]));
             let start = GPU_VRAM_START + i * LEDS_PER_GPU;
             for j in 0..LEDS_PER_GPU {
