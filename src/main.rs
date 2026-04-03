@@ -31,11 +31,8 @@ const GPU_BUSY_START: usize = 12;
 const GPU_VRAM_START: usize = 24;
 const LEDS_PER_GPU: usize = 4;
 
-// Smoothing — metric values
-const POLL_MS: u64 = 33;
-const EMA_ALPHA: f64 = 0.3;
-const DELTA_CAP_UP: f64 = 5.0;    // max % rise per tick
-const DELTA_CAP_DOWN: f64 = 1.0;  // max % fall per tick
+const POLL_MS: u64 = 10;         // LED update interval
+const WINDOW_SIZE: usize = 50;   // rolling average window (= 500ms)
 
 // Smoothing — RGB color (visual smoothness)
 const COLOR_ALPHA: f64 = 0.03;
@@ -43,7 +40,6 @@ const COLOR_ALPHA: f64 = 0.03;
 // Temperature range (°C)
 const TEMP_MIN: f64 = 35.0;
 const TEMP_MAX: f64 = 90.0;
-
 
 // Color gradient: 11 stops from 0% to 100%
 const GRADIENT: [(u8, u8, u8); 11] = [
@@ -75,15 +71,26 @@ fn gradient_color(pct: f64) -> (u8, u8, u8) {
     )
 }
 
-fn smooth(current: f64, target: f64) -> f64 {
-    let ema = current + EMA_ALPHA * (target - current);
-    let delta = ema - current;
-    let capped = if delta >= 0.0 {
-        delta.min(DELTA_CAP_UP)
-    } else {
-        delta.max(-DELTA_CAP_DOWN)
-    };
-    current + capped
+struct RollingAvg {
+    buf: [f64; WINDOW_SIZE],
+    pos: usize,
+    count: usize,
+    sum: f64,
+}
+
+impl RollingAvg {
+    fn new() -> Self {
+        Self { buf: [0.0; WINDOW_SIZE], pos: 0, count: 0, sum: 0.0 }
+    }
+
+    fn push(&mut self, val: f64) -> f64 {
+        self.sum -= self.buf[self.pos];
+        self.buf[self.pos] = val;
+        self.sum += val;
+        self.pos = (self.pos + 1) % WINDOW_SIZE;
+        if self.count < WINDOW_SIZE { self.count += 1; }
+        self.sum / self.count as f64
+    }
 }
 
 struct SmoothColor {
@@ -155,8 +162,7 @@ fn write_metrics(cpu: f64, ram: f64, cpu_temp: f64, gpus: &[(f64, f64, f64)]) {
     }
 }
 
-fn main() {
-    // Wait for OpenRGB server to be ready
+fn connect_and_init() -> TcpStream {
     let mut stream = loop {
         match TcpStream::connect(format!("{HOST}:{PORT}")) {
             Ok(s) => break s,
@@ -166,8 +172,6 @@ fn main() {
             }
         }
     };
-
-    // Set direct mode (server is up, but give it time to detect hardware)
     thread::sleep(Duration::from_secs(3));
     std::process::Command::new("openrgb")
         .args(["--device", "0", "--mode", "direct"])
@@ -181,6 +185,50 @@ fn main() {
     read_response(&mut stream);
     send_packet(&mut stream, DEVICE, 1, &[]);
     read_response(&mut stream);
+    stream
+}
+
+fn send_leds(stream: &mut TcpStream, leds: &[[u8; 4]; 265]) {
+    let n = DEVICE_TOTAL_LEDS;
+    let data_size = 4 + 2 + (n as u32) * 4;
+    let mut buf = Vec::with_capacity(data_size as usize);
+    buf.extend_from_slice(&data_size.to_le_bytes());
+    buf.extend_from_slice(&n.to_le_bytes());
+    for led in leds {
+        buf.extend_from_slice(led);
+    }
+    send_packet(stream, DEVICE, 1050, &buf);
+}
+
+fn run_test(stream: &mut TcpStream) {
+    eprintln!("sysmon: running 10-second ramp test (0→100%)");
+    let duration_ms = 10_000u64;
+    let start = std::time::Instant::now();
+    loop {
+        let elapsed = start.elapsed().as_millis() as u64;
+        if elapsed >= duration_ms { break; }
+        let pct = elapsed as f64 / duration_ms as f64 * 100.0;
+        let (r, g, b) = gradient_color(pct);
+        let color = apply_brightness([g, r, b, 0], pct); // R/G swapped
+        let mut leds = [[0u8; 4]; 265];
+        for i in 0..PCB_LEDS      { leds[PCB_OFFSET + i]      = color; }
+        for i in 0..IO_COVER_LEDS { leds[IO_COVER_OFFSET + i] = color; }
+        for i in 0..36            { leds[AIO_OFFSET + i]      = color; }
+        send_leds(stream, &leds);
+        thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("sysmon: test done");
+}
+
+fn main() {
+    let test_mode = std::env::args().any(|a| a == "--test");
+
+    let mut stream = connect_and_init();
+
+    if test_mode {
+        run_test(&mut stream);
+        return;
+    }
 
     // Discover hardware
     let mut cpu_reader = cpu::CpuReader::new();
@@ -193,55 +241,38 @@ fn main() {
         if cpu_temp_sensor.is_some() { "yes" } else { "no" },
         gpu_temp_sensor.sensor_count());
 
-    // Smoothed values
-    let mut s_cpu = 0.0f64;
-    let mut s_ram = 0.0f64;
-    let mut s_gpu_busy = vec![0.0f64; gpus.len()];
-    let mut s_gpu_vram = vec![0.0f64; gpus.len()];
-    let mut s_cpu_temp = 0.0f64;
-    let mut s_gpu_temp = 0.0f64;
+    // Rolling averages for each metric
+    let mut r_cpu      = RollingAvg::new();
+    let mut r_ram      = RollingAvg::new();
+    let mut r_cpu_temp = RollingAvg::new();
+    let mut r_gpu_temp = RollingAvg::new();
+    let mut r_gpu_busy: Vec<RollingAvg> = (0..gpus.len()).map(|_| RollingAvg::new()).collect();
+    let mut r_gpu_vram: Vec<RollingAvg> = (0..gpus.len()).map(|_| RollingAvg::new()).collect();
 
     // Smoothed colors
-    let mut c_cpu = SmoothColor::new();
-    let mut c_ram = SmoothColor::new();
+    let mut c_cpu      = SmoothColor::new();
+    let mut c_ram      = SmoothColor::new();
     let mut c_cpu_temp = SmoothColor::new();
     let mut c_gpu_temp = SmoothColor::new();
     let mut c_gpu_busy: Vec<SmoothColor> = (0..gpus.len()).map(|_| SmoothColor::new()).collect();
     let mut c_gpu_vram: Vec<SmoothColor> = (0..gpus.len()).map(|_| SmoothColor::new()).collect();
 
-    // LED buffer: 265 LEDs × 4 bytes (R,G,B,0) + header (4 + 2)
-    let n = DEVICE_TOTAL_LEDS;
-    let data_size = 4 + 2 + (n as u32) * 4;
-
+    let mut gpu_metrics = vec![(0.0f64, 0.0f64, 0.0f64); gpus.len()];
     let mut tick = 0u32;
     loop {
-        // Read raw metrics
-        let raw_cpu = cpu_reader.read();
-        let raw_ram = mem::read();
-        let raw_cpu_temp = cpu_temp_sensor.as_ref().map(|s| s.read()).unwrap_or(0.0);
-        let raw_gpu_temp = gpu_temp_sensor.read_hottest();
+        // Read metrics every tick, smooth via rolling average
+        let s_cpu      = r_cpu.push(cpu_reader.read());
+        let s_ram      = r_ram.push(mem::read());
+        let s_cpu_temp = r_cpu_temp.push(cpu_temp_sensor.as_ref().map(|s| s.read()).unwrap_or(0.0));
+        let s_gpu_temp = r_gpu_temp.push(gpu_temp_sensor.read_hottest());
 
-        // Smooth
-        s_cpu = smooth(s_cpu, raw_cpu);
-        s_ram = smooth(s_ram, raw_ram);
-        s_cpu_temp = smooth(s_cpu_temp, raw_cpu_temp);
-        s_gpu_temp = smooth(s_gpu_temp, raw_gpu_temp);
-
-        let mut gpu_metrics = Vec::with_capacity(gpus.len());
         for (i, g) in gpus.iter().enumerate() {
-            let raw_busy = g.read_busy();
-            let raw_vram = g.read_vram_percent();
-            s_gpu_busy[i] = smooth(s_gpu_busy[i], raw_busy);
-            s_gpu_vram[i] = smooth(s_gpu_vram[i], raw_vram);
-            gpu_metrics.push((s_gpu_busy[i], s_gpu_vram[i], raw_gpu_temp));
+            let s_busy = r_gpu_busy[i].push(g.read_busy());
+            let s_vram = r_gpu_vram[i].push(g.read_vram_percent());
+            gpu_metrics[i] = (s_busy, s_vram, s_gpu_temp);
         }
 
         // Build LED buffer
-        let mut buf = Vec::with_capacity(data_size as usize);
-        buf.extend_from_slice(&data_size.to_le_bytes());
-        buf.extend_from_slice(&n.to_le_bytes());
-
-        // Start with all LEDs off
         let mut leds = [[0u8; 4]; 265];
 
         // IO Cover (176-184): CPU temperature (R/G swapped)
@@ -271,7 +302,8 @@ fn main() {
 
         // Bottom fan: GPU busy (4 LEDs per GPU, R/G swapped)
         for (i, c) in c_gpu_busy.iter_mut().enumerate() {
-            let rgb = apply_brightness(c.update(gradient_color(s_gpu_busy[i])), s_gpu_busy[i]);
+            let s_busy = gpu_metrics[i].0;
+            let rgb = apply_brightness(c.update(gradient_color(s_busy)), s_busy);
             let start = GPU_BUSY_START + i * LEDS_PER_GPU;
             for j in 0..LEDS_PER_GPU {
                 leds[AIO_OFFSET + start + j] = [rgb[1], rgb[0], rgb[2], 0];
@@ -280,22 +312,18 @@ fn main() {
 
         // Top fan: GPU VRAM (4 LEDs per GPU, R/G swapped)
         for (i, c) in c_gpu_vram.iter_mut().enumerate() {
-            let rgb = apply_brightness(c.update(gradient_color(s_gpu_vram[i])), s_gpu_vram[i]);
+            let s_vram = gpu_metrics[i].1;
+            let rgb = apply_brightness(c.update(gradient_color(s_vram)), s_vram);
             let start = GPU_VRAM_START + i * LEDS_PER_GPU;
             for j in 0..LEDS_PER_GPU {
                 leds[AIO_OFFSET + start + j] = [rgb[1], rgb[0], rgb[2], 0];
             }
         }
 
-        // Serialize LED data
-        for led in &leds {
-            buf.extend_from_slice(led);
-        }
-
-        send_packet(&mut stream, DEVICE, 1050, &buf);
+        send_leds(&mut stream, &leds);
 
         // Write metrics JSON every ~1 second
-        if tick % 10 == 0 {
+        if tick % 100 == 0 {
             write_metrics(s_cpu, s_ram, s_cpu_temp, &gpu_metrics);
         }
 
