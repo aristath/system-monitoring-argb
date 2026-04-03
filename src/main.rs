@@ -32,17 +32,18 @@ const GPU_VRAM_START: usize = 24;
 const LEDS_PER_GPU: usize = 4;
 
 // Smoothing — metric values
-const POLL_MS: u64 = 100;
+const POLL_MS: u64 = 33;
 const EMA_ALPHA: f64 = 0.3;
-const DELTA_CAP_UP: f64 = 25.0;   // max % rise per tick
-const DELTA_CAP_DOWN: f64 = 2.5;  // max % fall per tick
+const DELTA_CAP_UP: f64 = 5.0;    // max % rise per tick
+const DELTA_CAP_DOWN: f64 = 1.0;  // max % fall per tick
 
 // Smoothing — RGB color (visual smoothness)
-const COLOR_ALPHA: f64 = 0.08;
+const COLOR_ALPHA: f64 = 0.03;
 
 // Temperature range (°C)
 const TEMP_MIN: f64 = 35.0;
 const TEMP_MAX: f64 = 90.0;
+
 
 // Color gradient: 11 stops from 0% to 100%
 const GRADIENT: [(u8, u8, u8); 11] = [
@@ -102,6 +103,16 @@ impl SmoothColor {
         self.b += COLOR_ALPHA * (target.2 as f64 - self.b);
         [self.r.round() as u8, self.g.round() as u8, self.b.round() as u8, 0]
     }
+}
+
+fn apply_brightness(rgb: [u8; 4], pct: f64) -> [u8; 4] {
+    let b = 0.03 + 0.97 * (pct / 100.0);
+    [
+        (rgb[0] as f64 * b).round() as u8,
+        (rgb[1] as f64 * b).round() as u8,
+        (rgb[2] as f64 * b).round() as u8,
+        0,
+    ]
 }
 
 fn temp_to_pct(temp: f64) -> f64 {
@@ -234,31 +245,33 @@ fn main() {
         let mut leds = [[0u8; 4]; 265];
 
         // IO Cover (176-184): CPU temperature (R/G swapped)
-        let cpu_temp_rgb = c_cpu_temp.update(gradient_color(temp_to_pct(s_cpu_temp)));
+        let cpu_temp_pct = temp_to_pct(s_cpu_temp);
+        let cpu_temp_rgb = apply_brightness(c_cpu_temp.update(gradient_color(cpu_temp_pct)), cpu_temp_pct);
         for i in 0..IO_COVER_LEDS {
             leds[IO_COVER_OFFSET + i] = [cpu_temp_rgb[1], cpu_temp_rgb[0], cpu_temp_rgb[2], 0];
         }
 
         // PCB (161-175): GPU temperature (R/G swapped)
-        let gpu_temp_rgb = c_gpu_temp.update(gradient_color(temp_to_pct(s_gpu_temp)));
+        let gpu_temp_pct = temp_to_pct(s_gpu_temp);
+        let gpu_temp_rgb = apply_brightness(c_gpu_temp.update(gradient_color(gpu_temp_pct)), gpu_temp_pct);
         for i in 0..PCB_LEDS {
             leds[PCB_OFFSET + i] = [gpu_temp_rgb[1], gpu_temp_rgb[0], gpu_temp_rgb[2], 0];
         }
 
         // AIO pump: CPU + RAM (R/G swapped for AIO zone)
-        let cpu_rgb = c_cpu.update(gradient_color(s_cpu));
+        let cpu_rgb = apply_brightness(c_cpu.update(gradient_color(s_cpu)), s_cpu);
         for &idx in &CPU_LEDS {
             leds[AIO_OFFSET + idx] = [cpu_rgb[1], cpu_rgb[0], cpu_rgb[2], 0];
         }
 
-        let ram_rgb = c_ram.update(gradient_color(s_ram));
+        let ram_rgb = apply_brightness(c_ram.update(gradient_color(s_ram)), s_ram);
         for &idx in &RAM_LEDS {
             leds[AIO_OFFSET + idx] = [ram_rgb[1], ram_rgb[0], ram_rgb[2], 0];
         }
 
         // Bottom fan: GPU busy (4 LEDs per GPU, R/G swapped)
         for (i, c) in c_gpu_busy.iter_mut().enumerate() {
-            let rgb = c.update(gradient_color(s_gpu_busy[i]));
+            let rgb = apply_brightness(c.update(gradient_color(s_gpu_busy[i])), s_gpu_busy[i]);
             let start = GPU_BUSY_START + i * LEDS_PER_GPU;
             for j in 0..LEDS_PER_GPU {
                 leds[AIO_OFFSET + start + j] = [rgb[1], rgb[0], rgb[2], 0];
@@ -267,7 +280,7 @@ fn main() {
 
         // Top fan: GPU VRAM (4 LEDs per GPU, R/G swapped)
         for (i, c) in c_gpu_vram.iter_mut().enumerate() {
-            let rgb = c.update(gradient_color(s_gpu_vram[i]));
+            let rgb = apply_brightness(c.update(gradient_color(s_gpu_vram[i])), s_gpu_vram[i]);
             let start = GPU_VRAM_START + i * LEDS_PER_GPU;
             for j in 0..LEDS_PER_GPU {
                 leds[AIO_OFFSET + start + j] = [rgb[1], rgb[0], rgb[2], 0];
