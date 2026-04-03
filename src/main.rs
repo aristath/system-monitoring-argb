@@ -32,7 +32,7 @@ const GPU_VRAM_START: usize = 24;
 const LEDS_PER_GPU: usize = 4;
 
 const POLL_MS: u64 = 10;         // LED update interval
-const WINDOW_SIZE: usize = 50;   // rolling average window (= 500ms)
+const WINDOW_SIZE: usize = 200;  // rolling average window (= 2000ms)
 
 // Smoothing — RGB color (visual smoothness)
 const COLOR_ALPHA: f64 = 0.03;
