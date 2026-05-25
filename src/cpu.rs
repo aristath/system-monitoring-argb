@@ -8,7 +8,10 @@ pub struct CpuReader {
 impl CpuReader {
     pub fn new() -> Self {
         let (idle, total) = Self::read_stat();
-        Self { prev_idle: idle, prev_total: total }
+        Self {
+            prev_idle: idle,
+            prev_total: total,
+        }
     }
 
     pub fn read(&mut self) -> f64 {
